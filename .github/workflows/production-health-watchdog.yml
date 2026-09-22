@@ -1,0 +1,157 @@
+name: Production Health Watchdog
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      failure_mode:
+        description: 'Trusted drill only: simulate an unreachable production endpoint'
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - simulate_unreachable
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: production-health-watchdog
+  cancel-in-progress: false
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    env:
+      HEALTH_URL: https://kreo-copy-ledger-5.vercel.app/api/health
+      HEALTH_MONITOR_KEY: ${{ secrets.HEALTH_MONITOR_KEY }}
+      GH_TOKEN: ${{ github.token }}
+      FAILURE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.failure_mode || 'none' }}
+      INCIDENT_TITLE: '[watchdog] Production health incident'
+      REMINDER_SECONDS: '21600'
+    steps:
+      - name: Check secured production health boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${HEALTH_MONITOR_KEY:-}" ]]; then
+            echo 'HEALTH_MONITOR_KEY is not configured. Refusing to run without the dedicated monitor credential.' >&2
+            exit 2
+          fi
+
+          response_file="$(mktemp)"
+          trap 'rm -f "$response_file"' EXIT
+
+          curl_rc=0
+          http_code="$(
+            curl \
+              --silent \
+              --show-error \
+              --location \
+              --connect-timeout 10 \
+              --max-time 20 \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              --header "X-Health-Monitor-Key: ${HEALTH_MONITOR_KEY}" \
+              "$HEALTH_URL"
+          )" || curl_rc=$?
+
+          category='healthy'
+
+          if [[ "$FAILURE_MODE" == 'simulate_unreachable' ]]; then
+            category='unreachable'
+          elif (( curl_rc != 0 )); then
+            category='unreachable'
+          elif ! [[ "$http_code" =~ ^[0-9]{3}$ ]] || (( 10#$http_code < 200 || 10#$http_code >= 400 )); then
+            category='http_error'
+          else
+            state="$(jq -r 'if type == "object" then (.state // empty) else empty end' "$response_file" 2>/dev/null || true)"
+            case "$state" in
+              GREEN|DEGRADED)
+                category='healthy'
+                ;;
+              HALTED)
+                category='halted'
+                ;;
+              *)
+                category='malformed_response'
+                ;;
+            esac
+          fi
+
+          now_iso="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          now_epoch="$(date -u +%s)"
+
+          open_issue_number="$(
+            gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
+              --jq ".[] | select(.pull_request == null) | select(.title == env.INCIDENT_TITLE) | .number" \
+              | head -n 1
+          )"
+
+          if [[ "$category" == 'healthy' ]]; then
+            if [[ -n "$open_issue_number" ]]; then
+              gh issue comment "$open_issue_number" \
+                --repo "$GITHUB_REPOSITORY" \
+                --body "Recovered at ${now_iso}. The independent health boundary is healthy again."
+              gh issue close "$open_issue_number" \
+                --repo "$GITHUB_REPOSITORY" \
+                --reason completed
+            fi
+            echo "Independent production health check passed at ${now_iso}."
+            exit 0
+          fi
+
+          fingerprint="$(printf '%s' "$category" | sha256sum | awk '{print $1}')"
+          new_body="$(cat <<EOF
+          Independent production health monitoring detected an unhealthy condition at ${now_iso}.
+
+          Category: \`${category}\`
+
+          This issue intentionally contains no private engine diagnostics, credentials, trading data, database identifiers, wallet data, or health-response body.
+
+          <!-- fingerprint:${fingerprint} -->
+          <!-- last_reminder_epoch:${now_epoch} -->
+          EOF
+          )"
+
+          if [[ -z "$open_issue_number" ]]; then
+            gh issue create \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$INCIDENT_TITLE" \
+              --body "$new_body" >/dev/null
+            echo "Opened a new generic production-health incident."
+          else
+            existing_body="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${open_issue_number}" --jq '.body // ""')"
+            previous_fingerprint="$(printf '%s\n' "$existing_body" | sed -n 's/.*<!-- fingerprint:\([^ ]*\) -->.*/\1/p' | head -n 1)"
+            last_reminder_epoch="$(printf '%s\n' "$existing_body" | sed -n 's/.*<!-- last_reminder_epoch:\([0-9]*\) -->.*/\1/p' | head -n 1)"
+            last_reminder_epoch="${last_reminder_epoch:-0}"
+
+            if [[ "$previous_fingerprint" != "$fingerprint" ]]; then
+              gh issue comment "$open_issue_number" \
+                --repo "$GITHUB_REPOSITORY" \
+                --body "Incident condition changed at ${now_iso}; generic category is now \`${category}\`."
+              gh api \
+                --method PATCH \
+                "repos/${GITHUB_REPOSITORY}/issues/${open_issue_number}" \
+                -f body="$new_body" >/dev/null
+            elif (( now_epoch - last_reminder_epoch >= REMINDER_SECONDS )); then
+              gh issue comment "$open_issue_number" \
+                --repo "$GITHUB_REPOSITORY" \
+                --body "Reminder at ${now_iso}: the production-health incident remains unresolved."
+              refreshed_body="$(printf '%s\n' "$existing_body" | sed -E "s/<!-- last_reminder_epoch:[0-9]+ -->/<!-- last_reminder_epoch:${now_epoch} -->/")"
+              gh api \
+                --method PATCH \
+                "repos/${GITHUB_REPOSITORY}/issues/${open_issue_number}" \
+                -f body="$refreshed_body" >/dev/null
+            else
+              echo 'Unchanged incident is already open; duplicate notification suppressed.'
+            fi
+          fi
+
+          echo "Production health watchdog failed closed: ${category}." >&2
+          exit 1
