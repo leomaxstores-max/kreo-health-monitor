@@ -61,6 +61,8 @@ jobs:
               "$HEALTH_URL"
           )" || curl_rc=$?
 
+          echo "Health endpoint HTTP status: ${http_code}; curl_rc=${curl_rc}"
+
           category='healthy'
 
           if [[ "$FAILURE_MODE" == 'simulate_unreachable' ]]; then
